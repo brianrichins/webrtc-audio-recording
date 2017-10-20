@@ -27,6 +27,28 @@
 </div>
 
 <script src="AudioRecorder.js"></script>
+<script type="text/javascript">
+    var startButton = document.getElementById('btn-start-recording');
+    var stopButton = document.getElementById('btn-stop-recording');
 
+    var recorder = new AudioRecorder(null, (isRecording) => {
+        startButton.disabled = isRecording; 
+        stopButton.disabled = !isRecording;
+    });
+
+    startButton.onclick = recorder.start;
+    stopButton.onclick = function(){
+        recorder.stop(wavBlob => {
+            var url = URL.createObjectURL(wavBlob);
+            var audio = document.querySelector("audio");
+            audio.src = url;
+        });
+    }
+
+    // auto-record for demo
+    startButton.click();
+    setTimeout(()=>stopButton.click(), 1500);
+</script>
+    
 </body>
 </html>
