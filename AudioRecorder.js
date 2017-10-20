@@ -1,256 +1,150 @@
-// Based on Muaz Khan's RecordRTC Repository
-//
-// https://github.com/muaz-khan/RecordRTC
-//
-// www.MuazKhan.com
-
-var Storage = {};
-var AudioContext = window.AudioContext || window.webkitAudioContext;
-var recorder = new AudioRecorder();
-
-var startButton = document.getElementById('btn-start-recording');
-var stopButton = document.getElementById('btn-stop-recording');
-
-startButton.onclick = recorder.start;
-stopButton.onclick = recorder.stop;
-
-function AudioRecorder(config) {
-
-    config = config || {};
-
-    var self = this;
-    var mediaStream;
-    var audioInput;
-    var jsAudioNode;
-    var bufferSize = config.bufferSize || 4096;
-    var sampleRate = config.sampleRate || 44100;
-    var numberOfAudioChannels = config.numberOfAudioChannels || 2;
-    var leftChannel = [];
-    var rightChannel = [];
-    var recording = false;
-    var recordingLength = 0;
-    var isPaused = false;
-    var isAudioProcessStarted = false;
-
-    this.start = function() {
-        setupStorage();
-
-        navigator.mediaDevices.getUserMedia({audio: true})
-            .then(onMicrophoneCaptured)
-            .catch(onMicrophoneCaptureError);
+function AudioRecorder(configuration, onChange) {
+    let config = {
+        bufferSize : 4096,
+        sampleRate : 44100,
+        numChannels:  2 // 1 or 2
     };
-
-    this.stop = function() {
-        stopRecording(function(blob) {
-            startButton.disabled = false;
-            stopButton.disabled = true;
-
-            var url = URL.createObjectURL(blob);
-            var audio = document.querySelector("audio");
-            audio.src = url;
-        });
-    };
-
-    function stopRecording(callback) {
-
-        // stop recording
-        recording = false;
-
-        // to make sure onaudioprocess stops firing
-        audioInput.disconnect();
-        jsAudioNode.disconnect();
-
-        mergeLeftRightBuffers({
-            sampleRate: sampleRate,
-            numberOfAudioChannels: numberOfAudioChannels,
-            internalInterleavedLength: recordingLength,
-            leftBuffers: leftChannel,
-            rightBuffers: numberOfAudioChannels === 1 ? [] : rightChannel
-        }, function(buffer, view) {
-
-            self.blob = new Blob([view], {
-                type: 'audio/wav'
-            });
-
-            self.buffer = new ArrayBuffer(view.buffer.byteLength);
-            self.view = view;
-            self.sampleRate = sampleRate;
-            self.bufferSize = bufferSize;
-            self.length = recordingLength;
-
-            callback && callback(self.blob);
-
-            clearRecordedData();
-
-            isAudioProcessStarted = false;
-        });
+    if (configuration) {
+        Object.assign(config, configuration);
     }
 
-    function clearRecordedData() {
-            leftChannel = rightChannel = [];
-            recordingLength = 0;
-            isAudioProcessStarted = false;
-            recording = false;
-            isPaused = false;
-    }
+    let AudioPersist = window.AudioPersist = {},  //create global ref to prevent garbage collection of AudioContext
+        analyzer = {
+            mediaStream: null,
+            audioInput: null,
+            jsAudioNode: null,
+            leftChannel: [],
+            rightChannel: [],
+            recordingLength: 0
+        },
+        state = {  
+            recording: false,
+            audioStarted: false
+        };
+    Object.defineProperty(state, 'isRecording', {
+        get: function () { return this.recording; },
+        set: function (y) { this.recording = y; onChange && onChange(this.recording); }
+    });
 
-    function setupStorage() {
-        Storage.ctx = new AudioContext();
+    //TODO: add public methods/callbacks for monitoring recording state (bool) and analyzer data (volume)
+    let output = this.output = {};  //public access
 
-        if (Storage.ctx.createJavaScriptNode) {
-            jsAudioNode = Storage.ctx.createJavaScriptNode(bufferSize, numberOfAudioChannels, numberOfAudioChannels);
-        } else if (Storage.ctx.createScriptProcessor) {
-            jsAudioNode = Storage.ctx.createScriptProcessor(bufferSize, numberOfAudioChannels, numberOfAudioChannels);
+
+    this.start = function () {
+        setup();
+
+        navigator.mediaDevices.getUserMedia({ audio: true })
+            .then(onMicCaptured)
+            .catch(onMicCaptureError);
+    };
+
+    function setup() {
+        AudioPersist.ctx = new AudioContext();
+
+        if (AudioPersist.ctx.createJavaScriptNode) {
+            analyzer.jsAudioNode = AudioPersist.ctx.createJavaScriptNode(config.bufferSize, config.numChannels, config.numChannels);
+        } else if (AudioPersist.ctx.createScriptProcessor) {
+            analyzer.jsAudioNode = AudioPersist.ctx.createScriptProcessor(config.bufferSize, config.numChannels, config.numChannels);
         } else {
             throw 'WebAudio API has no support on this browser.';
         }
 
-        jsAudioNode.connect(Storage.ctx.destination);
+        analyzer.jsAudioNode.connect(AudioPersist.ctx.destination);
+    }
+    function teardown() {
+        analyzer.leftChannel = analyzer.rightChannel = [];
+        analyzer.recordingLength = 0;
+        //TODO: strip out unused refs to simplify teardown
+        analyzer.jsAudioNode.disconnect();
+        analyzer.mediaStream.getAudioTracks().forEach(t => t.stop());
+        analyzer.jsAudioNode = analyzer.mediaStream = analyzer.audioInput = analyzer.audioTrack = null;
+
+        //TODO: clear config (and nested configs) channel arrays (?)
+
+        AudioPersist.ctx.close();
+        delete AudioPersist.ctx;
     }
 
-    function onMicrophoneCaptured(microphone) {
-        startButton.disabled = true;
-        stopButton.disabled = false;
+    function onMicCaptured(micStream) {
+        analyzer.mediaStream = micStream;
 
-        mediaStream = microphone;
+        analyzer.audioInput = AudioPersist.ctx.createMediaStreamSource(micStream);
+        analyzer.audioInput.connect(analyzer.jsAudioNode);
 
-        audioInput = Storage.ctx.createMediaStreamSource(microphone);
-        audioInput.connect(jsAudioNode);
+        analyzer.jsAudioNode.onaudioprocess = onAudioProcess;
 
-        jsAudioNode.onaudioprocess = onAudioProcess;
-
-        recording = true;
+        state.isRecording = true;
     }
-
-    function onMicrophoneCaptureError() {
+    function onMicCaptureError() {
         console.log("There was an error accessing the microphone. You may need to allow the browser access");
+        //TODO: provide callback for UI feedback
     }
+   
 
     function onAudioProcess(e) {
-
-        if (isPaused) {
-            return;
-        }
-
         if (isMediaStreamActive() === false) {
-            if (!config.disableLogs) {
+            if (!config.disableLogs) {  //TODO: call out config options in declaration
                 console.log('MediaStream seems stopped.');
             }
         }
 
-        if (!recording) {
+        if (!state.isRecording) {
             return;
         }
 
-        if (!isAudioProcessStarted) {
-            isAudioProcessStarted = true;
+        if (!state.audioStarted) {  //TODO: call out config options in declaration
+            state.audioStarted = true;
             if (config.onAudioProcessStarted) {
                 config.onAudioProcessStarted();
             }
 
-            if (config.initCallback) {
+            if (config.initCallback) {   //TODO: call out config options in declaration
                 config.initCallback();
             }
         }
 
+
+        // clone the samples
         var left = e.inputBuffer.getChannelData(0);
+        analyzer.leftChannel.push(new Float32Array(left));
 
-        // we clone the samples
-        leftChannel.push(new Float32Array(left));
-
-        if (numberOfAudioChannels === 2) {
+        if (config.numChannels === 2) {
             var right = e.inputBuffer.getChannelData(1);
-            rightChannel.push(new Float32Array(right));
+            analyzer.rightChannel.push(new Float32Array(right));
         }
 
-        recordingLength += bufferSize;
-
-        // export raw PCM
-        self.recordingLength = recordingLength;
+        analyzer.recordingLength += config.bufferSize;
     }
 
     function isMediaStreamActive() {
-        if (config.checkForInactiveTracks === false) {
-            // always return "true"
-            return true;
-        }
-
-        if ('active' in mediaStream) {
-            if (!mediaStream.active) {
-                return false;
-            }
-        } else if ('ended' in mediaStream) { // old hack
-            if (mediaStream.ended) {
-                return false;
+        if (config.checkForInactiveTracks) {  //TODO: call out in config options
+            if ('active' in analyzer.mediaStream) {
+                return analyzer.mediaStream.active;
+            } else if ('ended' in analyzer.mediaStream) { // deprecated/removed - TODO: remove
+                return !analyzer.mediaStream.ended;
             }
         }
         return true;
     }
 
-    function mergeLeftRightBuffers(config, callback) {
-        function mergeAudioBuffers(config, cb) {
-            var numberOfAudioChannels = config.numberOfAudioChannels;
+    function mergeLeftRightBuffers(buffData, onMergeComplete) {
 
-            // todo: "slice(0)" --- is it causes loop? Should be removed?
-            var leftBuffers = config.leftBuffers.slice(0);
-            var rightBuffers = config.rightBuffers.slice(0);
-            var sampleRate = config.sampleRate;
-            var internalInterleavedLength = config.internalInterleavedLength;
-            var desiredSampRate = config.desiredSampRate;
+        function mergeAudioBuffers(msgData, onMsgHandled) {
+            var numChannels = msgData.numChannels;
+            var sampleRate = msgData.sampleRate;
+            var leftBuffer = msgData.leftBuffers.slice(0);
+            var rightBuffer = msgData.rightBuffers.slice(0);
 
-            if (numberOfAudioChannels === 2) {
-                leftBuffers = mergeBuffers(leftBuffers, internalInterleavedLength);
-                rightBuffers = mergeBuffers(rightBuffers, internalInterleavedLength);
-                if (desiredSampRate) {
-                    leftBuffers = interpolateArray(leftBuffers, desiredSampRate, sampleRate);
-                    rightBuffers = interpolateArray(rightBuffers, desiredSampRate, sampleRate);
-                }
+            // merge buffer arrays
+            leftBuffer = flattenBuffer(leftBuffer);
+            if (numChannels === 2) {
+                rightBuffer = flattenBuffer(rightBuffer);
             }
 
-            if (numberOfAudioChannels === 1) {
-                leftBuffers = mergeBuffers(leftBuffers, internalInterleavedLength);
-                if (desiredSampRate) {
-                    leftBuffers = interpolateArray(leftBuffers, desiredSampRate, sampleRate);
-                }
-            }
+            function flattenBuffer(channelBuffer) {
+                var result = new Float64Array(channelBuffer.length * channelBuffer[0].length);
 
-            // set sample rate as desired sample rate
-            if (desiredSampRate) {
-                sampleRate = desiredSampRate;
-            }
-
-            // for changing the sampling rate, reference:
-            // http://stackoverflow.com/a/28977136/552182
-            function interpolateArray(data, newSampleRate, oldSampleRate) {
-                var fitCount = Math.round(data.length * (newSampleRate / oldSampleRate));
-                //var newData = new Array();
-                var newData = [];
-                //var springFactor = new Number((data.length - 1) / (fitCount - 1));
-                var springFactor = Number((data.length - 1) / (fitCount - 1));
-                newData[0] = data[0]; // for new allocation
-                for (var i = 1; i < fitCount - 1; i++) {
-                    var tmp = i * springFactor;
-                    //var before = new Number(Math.floor(tmp)).toFixed();
-                    //var after = new Number(Math.ceil(tmp)).toFixed();
-                    var before = Number(Math.floor(tmp)).toFixed();
-                    var after = Number(Math.ceil(tmp)).toFixed();
-                    var atPoint = tmp - before;
-                    newData[i] = linearInterpolate(data[before], data[after], atPoint);
-                }
-                newData[fitCount - 1] = data[data.length - 1]; // for new allocation
-                return newData;
-            }
-
-            function linearInterpolate(before, after, atPoint) {
-                return before + (after - before) * atPoint;
-            }
-
-            function mergeBuffers(channelBuffer, rLength) {
-                var result = new Float64Array(rLength);
-                var offset = 0;
-                var lng = channelBuffer.length;
-
-                for (var i = 0; i < lng; i++) {
+                for (let i = 0, offset = 0; i < channelBuffer.length; i++) {
                     var buffer = channelBuffer[i];
                     result.set(buffer, offset);
                     offset += buffer.length;
@@ -259,100 +153,67 @@ function AudioRecorder(config) {
                 return result;
             }
 
-            function interleave(leftChannel, rightChannel) {
-                var length = leftChannel.length + rightChannel.length;
+
+            // interleave channels together (if needed)
+            let interleaved = (numChannels === 1) ? leftBuffer : interleave(leftBuffer, rightBuffer),
+                interleavedLength = interleaved.length;
+
+            function interleave(leftChan, rightChan) {
+                var length = leftChan.length + rightChan.length;
 
                 var result = new Float64Array(length);
 
                 var inputIndex = 0;
 
                 for (var index = 0; index < length;) {
-                    result[index++] = leftChannel[inputIndex];
-                    result[index++] = rightChannel[inputIndex];
+                    result[index++] = leftChan[inputIndex];
+                    result[index++] = rightChan[inputIndex];
                     inputIndex++;
                 }
                 return result;
             }
 
+
+            // create wav file
             function writeUTFBytes(view, offset, string) {
-                var lng = string.length;
-                for (var i = 0; i < lng; i++) {
+                for (let i = 0; i < string.length; i++) {
                     view.setUint8(offset + i, string.charCodeAt(i));
                 }
             }
 
-            // interleave both channels together
-            var interleaved;
-
-            if (numberOfAudioChannels === 2) {
-                interleaved = interleave(leftBuffers, rightBuffers);
-            }
-
-            if (numberOfAudioChannels === 1) {
-                interleaved = leftBuffers;
-            }
-
-            var interleavedLength = interleaved.length;
-
-            // create wav file
             var resultingBufferLength = 44 + interleavedLength * 2;
-
             var buffer = new ArrayBuffer(resultingBufferLength);
-
             var view = new DataView(buffer);
 
-            // RIFF chunk descriptor/identifier
-            writeUTFBytes(view, 0, 'RIFF');
-
-            // RIFF chunk length
-            view.setUint32(4, 44 + interleavedLength * 2, true);
-
-            // RIFF type
-            writeUTFBytes(view, 8, 'WAVE');
+            writeUTFBytes(view, 0, 'RIFF'); // RIFF chunk descriptor/identifier
+            view.setUint32(4, 44 + interleavedLength * 2, true); // RIFF chunk length
+            writeUTFBytes(view, 8, 'WAVE'); // RIFF type
 
             // format chunk identifier
-            // FMT sub-chunk
-            writeUTFBytes(view, 12, 'fmt ');
+            writeUTFBytes(view, 12, 'fmt ');    // FMT sub-chunk
+            view.setUint32(16, 16, true);   // format chunk length
+            view.setUint16(20, 1, true);    // sample format (raw)
 
-            // format chunk length
-            view.setUint32(16, 16, true);
-
-            // sample format (raw)
-            view.setUint16(20, 1, true);
-
-            // stereo (2 channels)
-            view.setUint16(22, numberOfAudioChannels, true);
-
-            // sample rate
-            view.setUint32(24, sampleRate, true);
-
-            // byte rate (sample rate * block align)
-            view.setUint32(28, sampleRate * 2, true);
-
-            // block align (channel count * bytes per sample)
-            view.setUint16(32, numberOfAudioChannels * 2, true);
-
-            // bits per sample
-            view.setUint16(34, 16, true);
+            view.setUint16(22, numChannels, true);  // stereo (2 channels)
+            view.setUint32(24, msgData.sampleRate, true);    // sample rate
+            view.setUint32(28, msgData.sampleRate * 2, true);    // byte rate (sample rate * block align)
+            view.setUint16(32, numChannels * 2, true);  // block align (channel count * bytes per sample)
+            view.setUint16(34, 16, true);   // bits per sample
 
             // data sub-chunk
-            // data chunk identifier
-            writeUTFBytes(view, 36, 'data');
-
-            // data chunk length
-            view.setUint32(40, interleavedLength * 2, true);
+            writeUTFBytes(view, 36, 'data');    // data chunk identifier
+            view.setUint32(40, interleavedLength * 2, true);    // data chunk length
 
             // write the PCM samples
-            var lng = interleavedLength;
             var index = 44;
             var volume = 1;
-            for (var i = 0; i < lng; i++) {
+            for (let i = 0; i < interleavedLength; i++) {
                 view.setInt16(index, interleaved[i] * (0x7FFF * volume), true);
                 index += 2;
             }
 
-            if (cb) {
-                return cb({
+            if (onMsgHandled) {
+                return onMsgHandled({
                     buffer: buffer,
                     view: view
                 });
@@ -365,26 +226,61 @@ function AudioRecorder(config) {
         }
 
         var webWorker = processInWebWorker(mergeAudioBuffers);
-
-        webWorker.onmessage = function(event) {
-            callback(event.data.buffer, event.data.view);
+        webWorker.onmessage = function (event) {
+            onMergeComplete(event.data.buffer, event.data.view);
 
             // release memory
             URL.revokeObjectURL(webWorker.workerURL);
+            webWorker.terminate();
         };
-
-        webWorker.postMessage(config);
+        webWorker.postMessage(buffData);
     }
 
     function processInWebWorker(_function) {
         var workerURL = URL.createObjectURL(new Blob([_function.toString(),
             ';this.onmessage =  function (e) {' + _function.name + '(e.data);}'
-        ], {
-            type: 'application/javascript'
-        }));
+            ], {
+                type: 'application/javascript'
+            }));
 
         var worker = new Worker(workerURL);
         worker.workerURL = workerURL;
         return worker;
     }
-}
+
+
+    this.stop = function (handleBlobUrl) {
+        stopRecording(handleBlobUrl);
+    };
+    function stopRecording(onOutputReady) {
+        state.isRecording = state.audioStarted = false;
+
+        // to make sure onaudioprocess stops firing
+        analyzer.audioInput.disconnect();
+        analyzer.jsAudioNode.disconnect();
+
+        let bufferData = {
+            numChannels: config.numChannels,
+            sampleRate: config.sampleRate,
+            leftBuffers: analyzer.leftChannel,
+            rightBuffers: config.numChannels === 1 ? [] : analyzer.rightChannel
+        };
+        mergeLeftRightBuffers(bufferData, writeWavToOutput);
+
+        function writeWavToOutput(buffer, view) {
+            output.wavBlob = new Blob([view], {
+                type: 'audio/wav'
+            });
+
+            output.buffer = new ArrayBuffer(view.buffer.byteLength);
+            output.view = view;
+            output.sampleRate = config.sampleRate;
+            output.bufferSize = config.bufferSize;
+            output.length = analyzer.recordingLength;
+
+            onOutputReady && onOutputReady(output.wavBlob);
+
+            teardown();
+        }
+    }
+};
